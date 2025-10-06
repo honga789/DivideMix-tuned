@@ -105,23 +105,27 @@ def train_text(epoch, net, net2, optimizer, labeled_trainloader, unlabeled_train
         amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         optimizer.zero_grad(set_to_none=True)
         with autocast(device_type="cuda", dtype=amp_dtype):
-            # --- Unlabeled: co-guess + sharpening (không mixup) ---
+            x1 = net(inputs_x)
+            x2 = net(inputs_x2)
+
+            u11g = net(inputs_u)
+            u12g = net(inputs_u2)
+
             with torch.no_grad():
-                u11 = net(inputs_u);  u12 = net(inputs_u2)
-                u21 = net2(inputs_u); u22 = net2(inputs_u2)
-                pu = (torch.softmax(u11,1)+torch.softmax(u12,1)+torch.softmax(u21,1)+torch.softmax(u22,1))/4
-                ptu = pu**(1/args.T)
-                targets_u = ptu/ptu.sum(dim=1, keepdim=True)
+                u21 = net2(inputs_u)
+                u22 = net2(inputs_u2)
+                pu = (torch.softmax(u11g,1) + torch.softmax(u12g,1)
+                      + torch.softmax(u21,1) + torch.softmax(u22,1)) / 4
+                ptu = pu ** (1/args.T)
+                targets_u = ptu / ptu.sum(dim=1, keepdim=True)
 
-                x1 = net(inputs_x); x2 = net(inputs_x2)
-                px = (torch.softmax(x1,1)+torch.softmax(x2,1))/2
-                px = w_x*labels_x + (1-w_x)*px
-                ptx = px**(1/args.T)
-                targets_x = (ptx/ptx.sum(dim=1, keepdim=True)).detach()
+                px = (torch.softmax(x1,1) + torch.softmax(x2,1)) / 2
+                px = w_x * labels_x + (1 - w_x) * px
+                ptx = px ** (1/args.T)
+                targets_x = (ptx / ptx.sum(dim=1, keepdim=True)).detach()
 
-            # Dùng trung bình logits hai view để tính loss
-            outputs_x = (x1 + x2)/2
-            outputs_u = (u11 + u12)/2
+            outputs_x = (x1 + x2) / 2
+            outputs_u = (u11g + u12g) / 2
 
             Lx, Lu, lamb = criterion(
                 outputs_x, targets_x,
@@ -129,9 +133,10 @@ def train_text(epoch, net, net2, optimizer, labeled_trainloader, unlabeled_train
                 epoch + batch_idx/num_iter, args.warm_up
             )
 
-            # Regularization (giống nhánh image)
-            prior = torch.ones(args.num_class, device=outputs_x.device) / args.num_class
-            pred_mean = torch.softmax(torch.cat([outputs_x, outputs_u], dim=0), dim=1).mean(0)
+            # Regularization giống nhánh image
+            logits_all = torch.cat([outputs_x, outputs_u], dim=0)
+            prior = torch.ones(args.num_class, device=logits_all.device) / args.num_class
+            pred_mean = torch.softmax(logits_all, dim=1).mean(0)
             penalty = torch.sum(prior * torch.log(prior / pred_mean))
 
             loss = Lx + lamb * Lu + penalty
