@@ -8,6 +8,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
 import random
+from torch.amp import autocast, GradScaler
 from tqdm import tqdm
 from PreResNet import *
 from sklearn.mixture import GaussianMixture
@@ -63,7 +64,7 @@ torch.manual_seed(args.seed)
 torch.cuda.manual_seed_all(args.seed)
 
 # Training
-def train(epoch,net,net2,optimizer,labeled_trainloader,unlabeled_trainloader):
+def train(epoch, net, net2, optimizer, labeled_trainloader, unlabeled_trainloader, scaler):
     net.train()
     net2.eval() #fix one network and train the other
     
@@ -86,22 +87,23 @@ def train(epoch,net,net2,optimizer,labeled_trainloader,unlabeled_trainloader):
         inputs_u, inputs_u2 = inputs_u.cuda(), inputs_u2.cuda()
 
         with torch.no_grad():
-            # label co-guessing of unlabeled samples
-            outputs_u11 = net(inputs_u)
-            outputs_u12 = net(inputs_u2)
-            outputs_u21 = net2(inputs_u)
-            outputs_u22 = net2(inputs_u2)            
-            
+            amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            with autocast(device_type="cuda", dtype=amp_dtype):
+                # label co-guessing of unlabeled samples
+                outputs_u11 = net(inputs_u)
+                outputs_u12 = net(inputs_u2)
+                outputs_u21 = net2(inputs_u)
+                outputs_u22 = net2(inputs_u2)    
+                # label refinement of labeled samples
+                outputs_x = net(inputs_x)
+                outputs_x2 = net(inputs_x2)        
+                
             pu = (torch.softmax(outputs_u11, dim=1) + torch.softmax(outputs_u12, dim=1) + torch.softmax(outputs_u21, dim=1) + torch.softmax(outputs_u22, dim=1)) / 4       
             ptu = pu**(1/args.T) # temparature sharpening
             
             targets_u = ptu / ptu.sum(dim=1, keepdim=True) # normalize
             targets_u = targets_u.detach()       
-            
-            # label refinement of labeled samples
-            outputs_x = net(inputs_x)
-            outputs_x2 = net(inputs_x2)            
-            
+              
             px = (torch.softmax(outputs_x, dim=1) + torch.softmax(outputs_x2, dim=1)) / 2
             px = w_x*labels_x + (1-w_x)*px              
             ptx = px**(1/args.T) # temparature sharpening 
@@ -123,43 +125,50 @@ def train(epoch,net,net2,optimizer,labeled_trainloader,unlabeled_trainloader):
         
         mixed_input = l * input_a + (1 - l) * input_b        
         mixed_target = l * target_a + (1 - l) * target_b
-                
-        logits = net(mixed_input)
-        logits_x = logits[:batch_size*2]
-        logits_u = logits[batch_size*2:]        
-           
-        Lx, Lu, lamb = criterion(logits_x, mixed_target[:batch_size*2], logits_u, mixed_target[batch_size*2:], epoch+batch_idx/num_iter, args.warm_up)
-        
-        # regularization
-        prior = torch.ones(args.num_class)/args.num_class
-        prior = prior.cuda()        
-        pred_mean = torch.softmax(logits, dim=1).mean(0)
-        penalty = torch.sum(prior*torch.log(prior/pred_mean))
 
-        loss = Lx + lamb * Lu  + penalty
-        # compute gradient and do SGD step
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+        optimizer.zero_grad(set_to_none=True)
+        with autocast(device_type="cuda", dtype=amp_dtype):
+            logits = net(mixed_input)
+            logits_x = logits[:batch_size*2]
+            logits_u = logits[batch_size*2:]
+
+            Lx, Lu, lamb = criterion(
+                logits_x, mixed_target[:batch_size*2],
+                logits_u, mixed_target[batch_size*2:],
+                epoch+batch_idx/num_iter, args.warm_up
+            )
+
+            # regularization
+            prior = torch.ones(args.num_class, device=logits.device)/args.num_class
+            pred_mean = torch.softmax(logits, dim=1).mean(0)
+            penalty = torch.sum(prior*torch.log(prior/pred_mean))
+
+            loss = Lx + lamb * Lu + penalty
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
         # print(f"{epoch=}, {batch_idx=}, Lx={Lx.item():.2f}, Lu={Lu.item():.2f}")
 
-def warmup(epoch, net, optimizer, dataloader):
+def warmup(epoch, net, optimizer, dataloader, scaler):
     net.train()
     num_iter = (len(dataloader.dataset)//dataloader.batch_size)+1
     # for batch_idx, (inputs, labels, path) in enumerate(tqdm(dataloader, desc=f"Warmup Epoch {epoch}")):
     for batch_idx, (inputs, labels, path) in enumerate(dataloader):
-        inputs, labels = inputs.cuda(), labels.cuda()
-        optimizer.zero_grad()
-        outputs = net(inputs)
-        loss = CEloss(outputs, labels)
-        # if args.noise_mode=='asym':  # penalize confident prediction for asymmetric noise
-        #     penalty = conf_penalty(outputs)
-        #     L = loss + penalty      
-        # elif args.noise_mode=='sym':   
-        #     L = loss
-        L = loss
-        L.backward()
-        optimizer.step()
+        inputs = inputs.cuda(non_blocking=True)
+        labels = labels.cuda(non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+        amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        with autocast(device_type="cuda", dtype=amp_dtype):
+            outputs = net(inputs)
+            loss = CEloss(outputs, labels)
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
         # print(f"Warmup {epoch=}, {batch_idx=}, loss={loss.item():.4f}")
 
 def test(epoch,net1,net2):
@@ -168,12 +177,15 @@ def test(epoch,net1,net2):
     correct = 0
     total = 0
     with torch.no_grad():
+        amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         # for batch_idx, (inputs, targets) in enumerate(tqdm(test_loader, desc=f"Test Epoch {epoch}")):
         for batch_idx, (inputs, targets) in enumerate(test_loader):
             inputs, targets = inputs.cuda(), targets.cuda()
-            outputs1 = net1(inputs)
-            outputs2 = net2(inputs)           
-            outputs = outputs1+outputs2
+            with autocast(device_type="cuda", dtype=amp_dtype):
+                outputs1 = net1(inputs)
+                outputs2 = net2(inputs)           
+                outputs = outputs1+outputs2
+        
             _, predicted = torch.max(outputs, 1)            
                        
             total += targets.size(0)
@@ -187,13 +199,16 @@ def predict_testset(net1, net2, test_loader):
     all_preds = []
     all_targets = []
     with torch.no_grad():
+        amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         # for inputs, targets in tqdm(test_loader, desc="Predict Testset"):
         for inputs, targets in test_loader:
             inputs = inputs.cuda(non_blocking=True)
             targets = targets.cuda(non_blocking=True)
-            outputs1 = net1(inputs)
-            outputs2 = net2(inputs)
-            outputs = outputs1 + outputs2
+            with autocast(device_type="cuda", dtype=amp_dtype):
+                outputs1 = net1(inputs)
+                outputs2 = net2(inputs)
+                outputs = outputs1 + outputs2
+
             predicted = outputs.argmax(dim=1)
             all_preds.append(predicted.detach().cpu().numpy())
             all_targets.append(targets.detach().cpu().numpy())
@@ -224,11 +239,14 @@ def eval_train(model,all_loss):
     dataset_size = len(eval_loader.dataset)
     losses = torch.zeros(dataset_size)
     with torch.no_grad():
+        amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         # for batch_idx, (inputs, targets, index) in enumerate(tqdm(eval_loader, desc="Eval Train")):
         for batch_idx, (inputs, targets, index) in enumerate(eval_loader):
             inputs, targets = inputs.cuda(), targets.cuda() 
-            outputs = model(inputs) 
-            loss = CE(outputs, targets)  
+            with autocast(device_type="cuda", dtype=amp_dtype):
+                outputs = model(inputs) 
+                loss = CE(outputs, targets)  
+            
             for b in range(inputs.size(0)):
                 losses[index[b]]=loss[b]         
     losses = (losses-losses.min())/(losses.max()-losses.min())    
@@ -297,6 +315,9 @@ criterion = SemiLoss()
 optimizer1 = optim.SGD(net1.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
 optimizer2 = optim.SGD(net2.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
 
+scaler1 = GradScaler(device="cuda")
+scaler2 = GradScaler(device="cuda")
+
 CE = nn.CrossEntropyLoss(reduction='none')
 CEloss = nn.CrossEntropyLoss()
 conf_penalty = NegEntropy()
@@ -316,9 +337,9 @@ for epoch in tqdm(range(args.num_epochs+1), desc="Epochs"):
     if epoch < args.warm_up:
         warmup_trainloader = loader.run('warmup')
         print('Warmup Net1')
-        warmup(epoch, net1, optimizer1, warmup_trainloader)
+        warmup(epoch, net1, optimizer1, warmup_trainloader, scaler1)
         print('Warmup Net2')
-        warmup(epoch, net2, optimizer2, warmup_trainloader)
+        warmup(epoch, net2, optimizer2, warmup_trainloader, scaler2)
     else:
         prob1, all_loss[0] = eval_train(net1, all_loss[0])
         prob2, all_loss[1] = eval_train(net2, all_loss[1])
@@ -326,10 +347,10 @@ for epoch in tqdm(range(args.num_epochs+1), desc="Epochs"):
         pred2 = (prob2 > args.p_threshold)
         print('Train Net1')
         labeled_trainloader, unlabeled_trainloader = loader.run('train', pred2, prob2)
-        train(epoch, net1, net2, optimizer1, labeled_trainloader, unlabeled_trainloader)
+        train(epoch, net1, net2, optimizer1, labeled_trainloader, unlabeled_trainloader, scaler1)
         print('Train Net2')
         labeled_trainloader, unlabeled_trainloader = loader.run('train', pred1, prob1)
-        train(epoch, net2, net1, optimizer2, labeled_trainloader, unlabeled_trainloader)
+        train(epoch, net2, net1, optimizer2, labeled_trainloader, unlabeled_trainloader, scaler2)
     test(epoch, net1, net2)
     # Save test predictions at last epoch
     if epoch == args.num_epochs:
