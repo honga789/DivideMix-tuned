@@ -411,11 +411,10 @@ if args.data_type.lower() == 'image':
     optimizer1 = optim.SGD(net1.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
     optimizer2 = optim.SGD(net2.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
 else:
-    from transformers import AdamW
     params1 = [p for p in net1.parameters() if p.requires_grad]
     params2 = [p for p in net2.parameters() if p.requires_grad]
-    optimizer1 = AdamW(params1, lr=2e-5, weight_decay=0.01)
-    optimizer2 = AdamW(params2, lr=2e-5, weight_decay=0.01)
+    optimizer1 = optim.AdamW(params1, lr=2e-5, weight_decay=0.01)
+    optimizer2 = optim.AdamW(params2, lr=2e-5, weight_decay=0.01)
 
 scaler1 = GradScaler(device="cuda")
 scaler2 = GradScaler(device="cuda")
