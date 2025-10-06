@@ -153,8 +153,8 @@ class ResNet(nn.Module):
         if lin < 5 and lout > 3:
             out = self.layer4(out)
         if lout > 4:
-            out = F.avg_pool2d(out, 4)
-            out = out.view(out.size(0), -1)
+            out = F.adaptive_avg_pool2d(out, 1)  # global avg pool
+            out = torch.flatten(out, 1)
             out = self.linear(out)
         return out
 
