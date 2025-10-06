@@ -14,6 +14,7 @@ from PreResNet import *
 from sklearn.mixture import GaussianMixture
 from sklearn.metrics import accuracy_score, f1_score, classification_report
 from pprint import pprint
+from bert_mlp import BertMLP
 import dataloader_tuned as dataloader
 
 # ===== [A] START TIMER =====
@@ -47,7 +48,12 @@ parser.add_argument('--test_data_column', type=str, required=True)
 parser.add_argument('--test_label_column', type=str, required=True)
 parser.add_argument('--test_image_dir', type=str)
 parser.add_argument('--num_workers', default=4, type=int)
+# ---- TEXT ----
+parser.add_argument('--pretrained_name', type=str, default='bert-base-uncased')
+parser.add_argument('--freeze_backbone', type=int, default=1, help='1=freeze BERT backbone, 0=finetune')
+parser.add_argument('--max_length', type=int, default=256)
 args = parser.parse_args()
+args.pretrained_lm = getattr(args, 'pretrained_name', 'bert-base-uncased')
 
 pprint(vars(args))
 
@@ -63,8 +69,82 @@ random.seed(args.seed)
 torch.manual_seed(args.seed)
 torch.cuda.manual_seed_all(args.seed)
 
+def move_to_device(x):
+    # Hỗ trợ dict từ tokenizer, list/tuple lồng nhau
+    if isinstance(x, dict):
+        return {k: v.cuda(non_blocking=True) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return type(x)(move_to_device(xx) for xx in x)
+    return x.cuda(non_blocking=True)
+
+def train_text(epoch, net, net2, optimizer, labeled_trainloader, unlabeled_trainloader, scaler):
+    net.train()
+    net2.eval()
+    unlabeled_train_iter = iter(unlabeled_trainloader)
+    num_iter = (len(labeled_trainloader.dataset)//args.batch_size) + 1
+    criterion = SemiLoss()
+
+    for batch_idx, (inputs_x, inputs_x2, labels_x, w_x) in enumerate(labeled_trainloader):
+        try:
+            inputs_u, inputs_u2 = next(unlabeled_train_iter)
+        except:
+            unlabeled_train_iter = iter(unlabeled_trainloader)
+            inputs_u, inputs_u2 = next(unlabeled_train_iter)
+
+        bs = labels_x.size(0)
+        labels_x = torch.zeros(bs, args.num_class).scatter_(1, labels_x.view(-1,1), 1)
+        w_x = w_x.view(-1,1).float()
+
+        inputs_x  = move_to_device(inputs_x)
+        inputs_x2 = move_to_device(inputs_x2)
+        inputs_u  = move_to_device(inputs_u)
+        inputs_u2 = move_to_device(inputs_u2)
+        labels_x = labels_x.cuda(non_blocking=True)
+        w_x = w_x.cuda(non_blocking=True)
+
+        amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        optimizer.zero_grad(set_to_none=True)
+        with autocast(device_type="cuda", dtype=amp_dtype):
+            # --- Unlabeled: co-guess + sharpening (không mixup) ---
+            with torch.no_grad():
+                u11 = net(inputs_u);  u12 = net(inputs_u2)
+                u21 = net2(inputs_u); u22 = net2(inputs_u2)
+                pu = (torch.softmax(u11,1)+torch.softmax(u12,1)+torch.softmax(u21,1)+torch.softmax(u22,1))/4
+                ptu = pu**(1/args.T)
+                targets_u = ptu/ptu.sum(dim=1, keepdim=True)
+
+                x1 = net(inputs_x); x2 = net(inputs_x2)
+                px = (torch.softmax(x1,1)+torch.softmax(x2,1))/2
+                px = w_x*labels_x + (1-w_x)*px
+                ptx = px**(1/args.T)
+                targets_x = (ptx/ptx.sum(dim=1, keepdim=True)).detach()
+
+            # Dùng trung bình logits hai view để tính loss
+            outputs_x = (x1 + x2)/2
+            outputs_u = (u11 + u12)/2
+
+            Lx, Lu, lamb = criterion(
+                outputs_x, targets_x,
+                outputs_u, targets_u,
+                epoch + batch_idx/num_iter, args.warm_up
+            )
+
+            # Regularization (giống nhánh image)
+            prior = torch.ones(args.num_class, device=outputs_x.device) / args.num_class
+            pred_mean = torch.softmax(torch.cat([outputs_x, outputs_u], dim=0), dim=1).mean(0)
+            penalty = torch.sum(prior * torch.log(prior / pred_mean))
+
+            loss = Lx + lamb * Lu + penalty
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
 # Training
 def train(epoch, net, net2, optimizer, labeled_trainloader, unlabeled_trainloader, scaler):
+    if args.data_type.lower() == 'text':
+        return train_text(epoch, net, net2, optimizer, labeled_trainloader, unlabeled_trainloader, scaler)
+    
     net.train()
     net2.eval() #fix one network and train the other
     
@@ -157,7 +237,7 @@ def warmup(epoch, net, optimizer, dataloader, scaler):
     num_iter = (len(dataloader.dataset)//dataloader.batch_size)+1
     # for batch_idx, (inputs, labels, path) in enumerate(tqdm(dataloader, desc=f"Warmup Epoch {epoch}")):
     for batch_idx, (inputs, labels, path) in enumerate(dataloader):
-        inputs = inputs.cuda(non_blocking=True)
+        inputs = move_to_device(inputs)
         labels = labels.cuda(non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
@@ -180,7 +260,8 @@ def test(epoch,net1,net2):
         amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         # for batch_idx, (inputs, targets) in enumerate(tqdm(test_loader, desc=f"Test Epoch {epoch}")):
         for batch_idx, (inputs, targets) in enumerate(test_loader):
-            inputs, targets = inputs.cuda(), targets.cuda()
+            inputs = move_to_device(inputs)
+            targets = targets.cuda(non_blocking=True)
             with autocast(device_type="cuda", dtype=amp_dtype):
                 outputs1 = net1(inputs)
                 outputs2 = net2(inputs)           
@@ -202,7 +283,7 @@ def predict_testset(net1, net2, test_loader):
         amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         # for inputs, targets in tqdm(test_loader, desc="Predict Testset"):
         for inputs, targets in test_loader:
-            inputs = inputs.cuda(non_blocking=True)
+            inputs = move_to_device(inputs)
             targets = targets.cuda(non_blocking=True)
             with autocast(device_type="cuda", dtype=amp_dtype):
                 outputs1 = net1(inputs)
@@ -242,12 +323,14 @@ def eval_train(model,all_loss):
         amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         # for batch_idx, (inputs, targets, index) in enumerate(tqdm(eval_loader, desc="Eval Train")):
         for batch_idx, (inputs, targets, index) in enumerate(eval_loader):
-            inputs, targets = inputs.cuda(), targets.cuda() 
+            inputs = move_to_device(inputs)
+            targets = targets.cuda(non_blocking=True)
             with autocast(device_type="cuda", dtype=amp_dtype):
                 outputs = model(inputs) 
                 loss = CE(outputs, targets)  
             
-            for b in range(inputs.size(0)):
+            bs = targets.size(0)
+            for b in range(bs):
                 losses[index[b]]=loss[b]         
     losses = (losses-losses.min())/(losses.max()-losses.min())    
     all_loss.append(losses)
@@ -286,24 +369,35 @@ class NegEntropy(object):
         return torch.mean(torch.sum(probs.log()*probs, dim=1))
 
 def create_model():
-    model = ResNet18(num_classes=args.num_class)
+    if args.data_type.lower() == 'image':
+        model = ResNet18(num_classes=args.num_class)
+    else:
+        model = BertMLP(
+            pretrained_name=args.pretrained_name,
+            num_classes=args.num_class,
+            freeze_backbone=bool(args.freeze_backbone)
+        )
     model = model.cuda()
     return model
 
-loader = dataloader.dataloader_tuned(
-    batch_size=args.batch_size,
-    num_workers=args.num_workers,
-    image_size=args.image_size,
-    train_csv_path=args.train_csv_path,
-    train_feather_path=args.train_feather_path,
-    train_data_column=args.train_data_column,
-    train_label_column=args.train_label_column,
-    train_image_dir=args.train_image_dir,
-    test_csv_path=args.test_csv_path,
-    test_data_column=args.test_data_column,
-    test_label_column=args.test_label_column,
-    test_image_dir=args.test_image_dir
-)
+if args.data_type.lower() == 'image':
+    loader = dataloader.dataloader_tuned(
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        image_size=args.image_size,
+        train_csv_path=args.train_csv_path,
+        train_feather_path=args.train_feather_path,
+        train_data_column=args.train_data_column,
+        train_label_column=args.train_label_column,
+        train_image_dir=args.train_image_dir,
+        test_csv_path=args.test_csv_path,
+        test_data_column=args.test_data_column,
+        test_label_column=args.test_label_column,
+        test_image_dir=args.test_image_dir
+    )
+else:
+    import dataloader_tuned_text as text_loader
+    loader = text_loader.Loader(args)
 
 print('| Building net')
 net1 = create_model()
@@ -312,8 +406,16 @@ cudnn.benchmark = True
 
 
 criterion = SemiLoss()
-optimizer1 = optim.SGD(net1.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
-optimizer2 = optim.SGD(net2.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
+criterion = SemiLoss()
+if args.data_type.lower() == 'image':
+    optimizer1 = optim.SGD(net1.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
+    optimizer2 = optim.SGD(net2.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
+else:
+    from transformers import AdamW
+    params1 = [p for p in net1.parameters() if p.requires_grad]
+    params2 = [p for p in net2.parameters() if p.requires_grad]
+    optimizer1 = AdamW(params1, lr=2e-5, weight_decay=0.01)
+    optimizer2 = AdamW(params2, lr=2e-5, weight_decay=0.01)
 
 scaler1 = GradScaler(device="cuda")
 scaler2 = GradScaler(device="cuda")
