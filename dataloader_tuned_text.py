@@ -253,11 +253,11 @@ class Loader:
             )
             L = DataLoader(
                 ds_l, batch_size=A.batch_size, shuffle=True,
-                num_workers=A.num_workers, pin_memory=True, collate_fn=_collate_labeled
+                num_workers=A.num_workers, pin_memory=True, collate_fn=_collate_labeled, drop_last=True
             )
             U = DataLoader(
                 ds_u, batch_size=A.batch_size, shuffle=True,
-                num_workers=A.num_workers, pin_memory=True, collate_fn=_collate_unlabeled
+                num_workers=A.num_workers, pin_memory=True, collate_fn=_collate_unlabeled, drop_last=True
             )
             return L, U
 
